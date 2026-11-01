@@ -1,0 +1,35 @@
+# Install: see README.md ("Run as a service").
+[Unit]
+Description=iMac Display receiver (IDP v1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=imac-display
+Group=imac-display
+SupplementaryGroups=video render
+# kmssink needs to be DRM master: no display manager may run on this seat.
+Environment=SINK=kmssink
+Environment=DECODER=auto
+Environment=PORT=7878
+Environment=LOG_LEVEL=info
+# The service user has no home; keep GStreamer's plugin registry in the cache dir.
+CacheDirectory=imac-display-rx
+Environment=GST_REGISTRY=%C/imac-display-rx/gst-registry.bin
+# Optional per-machine overrides (PANEL_WIDTH, PANEL_MM, RECEIVER_NAME, ...).
+EnvironmentFile=-/etc/default/imac-display-rx
+ExecStart=/usr/local/bin/imac-display-rx
+Restart=always
+RestartSec=1
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
