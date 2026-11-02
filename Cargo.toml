@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "iMac Display Protocol (IDP v1) receiver: shows a Mac's virtual display on an Ubuntu iMac panel"
+license = "MIT"
 publish = false
 
 [lib]

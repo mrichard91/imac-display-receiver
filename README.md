@@ -7,12 +7,25 @@ Thunderbolt bridge, Ethernet or Wi-Fi. This receiver decodes the stream with
 VA-API and shows it full screen on the panel with `kmssink`.
 
 - Wire format: [`PROTOCOL.md`](PROTOCOL.md) (normative).
-- Implementation plan: [`PLAN.md`](PLAN.md) (tasks R0–R6 are this repository).
+- Implementation plan: [`PLAN.md`](PLAN.md) (R tasks are this repository;
+  §9 lists what is next).
 - Network addressing: [`docs/network-setup.md`](docs/network-setup.md).
 
+> [!WARNING]
+> **Protocol v1 has no authentication and no encryption.** The Mac's screen
+> crosses the network in plaintext, so anyone who can capture the traffic can
+> watch it. Anyone who can reach TCP port 7878 can put arbitrary video on the
+> panel, feed attacker-chosen HEVC to the GStreamer parser and decoder, or hold
+> the single sender slot so your Mac gets `BUSY`. The receiver listens on every
+> interface, IPv4 and IPv6, and has no bind-address option.
+>
+> Use a Thunderbolt or Ethernet cable or a trusted LAN, firewall the port to
+> your Mac's address ([Firewall](#5-firewall)), and never expose it to an
+> untrusted network or the internet. Details:
+> [`PROTOCOL.md` §10](PROTOCOL.md#10-security) and [`SECURITY.md`](SECURITY.md).
+
 One sender at a time; a second Mac that connects while one is streaming gets
-`GOODBYE BUSY`. v1 has no authentication or encryption (PROTOCOL.md §10), so
-keep the port on a point-to-point link or a trusted LAN.
+`GOODBYE BUSY`.
 
 ## Quick start (Ubuntu 24.04)
 
@@ -70,9 +83,10 @@ INFO  [gst] decoder vah265dec, sink kmssink
 INFO  [net] listening on [::]:7878 as "imac"
 ```
 
-While no sender is connected the panel shows the receiver's name and the
-`address:port` of each interface. On the Mac, choose **Connect…** in the
-sender's menu and enter one of them (for example `10.99.0.2`, port `7878`).
+While no sender is connected the panel shows the receiver's name, addresses
+(all except loopback and IPv6 link-local) and port. On the Mac, choose
+**Connect…** in the sender's menu and enter one of them (for example
+`10.99.0.2`, port `7878`).
 
 Useful options (each also has an environment variable, for systemd):
 
@@ -84,7 +98,7 @@ Useful options (each also has an environment variable, for systemd):
 | `--log-level`         | `LOG_LEVEL`         | `info`     | `debug` shows every keyframe request etc. |
 | `--name`              | `RECEIVER_NAME`     | hostname   | name shown in the sender's menu           |
 | `--max-bitrate-kbps`  | `MAX_BITRATE_KBPS`  | `0`        | bitrate hint for senders (0 = none)       |
-| `--idle-screen`       | `IDLE_SCREEN`       | `true`     | show name + `address:port` while idle     |
+| `--idle-screen`       | `IDLE_SCREEN`       | `true`     | show name, addresses and port while idle  |
 
 If the panel probe gets something wrong, override it with `PANEL_WIDTH`,
 `PANEL_HEIGHT`, `PANEL_REFRESH_MHZ` (60 Hz = `60000`) and `PANEL_MM`
@@ -102,6 +116,12 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
   --groups video,render imac-display
 sudo install -m 644 systemd/imac-display-rx.service /etc/systemd/system/
 ```
+
+The unit runs as the `imac-display` user with basic systemd hardening
+(`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
+`ProtectKernelTunables`, `ProtectControlGroups`, `RestrictAddressFamilies`)
+and `Restart=always`; further sandboxing is planned in
+[`PLAN.md` R10](PLAN.md#r10--systemd-hardening).
 
 The panel must be free for `kmssink`: boot to the console instead of the
 desktop (or stop GDM) on the iMac.
@@ -124,13 +144,34 @@ MAX_BITRATE_KBPS=150000
 
 ### 5. Firewall
 
-Only needed if `ufw` is enabled. Allow the sender's address (or subnet) rather
-than the whole network:
+Do this on any iMac that is connected to more than the cable to your Mac.
+Ubuntu ships with `ufw` disabled, and the receiver accepts connections on every
+interface (Wi-Fi, LAN, global IPv6), not only the link you meant to use. Allow
+the sender's address (or subnet) rather than the whole network:
 
 ```sh
+sudo ufw default deny incoming
+sudo ufw allow OpenSSH                                        # if you use ssh
 sudo ufw allow from 10.99.0.0/30 to any port 7878 proto tcp   # Thunderbolt bridge
-sudo ufw allow from 192.168.1.0/24 to any port 7878 proto tcp # a trusted LAN
+sudo ufw allow from 192.168.1.20 to any port 7878 proto tcp   # one Mac on the LAN
+sudo ufw enable
 ```
+
+A Mac that connects over IPv6 needs its own rule. Alternatively, or as well,
+restrict the service itself with a drop-in (`sudo systemctl edit
+imac-display-rx`); this works with `ufw` off and covers IPv4 and IPv6:
+
+```ini
+[Service]
+IPAddressDeny=any
+IPAddressAllow=localhost 10.99.0.0/30
+```
+
+To disclose less: set `RECEIVER_NAME` so HELLO does not carry the hostname,
+and `IDLE_SCREEN=false` if people you do not trust can see the panel (the idle
+screen shows the receiver's name, addresses and port). See
+[`docs/network-setup.md`](docs/network-setup.md#firewall) and
+[`SECURITY.md`](SECURITY.md).
 
 ## Testing without a Mac
 
@@ -160,3 +201,39 @@ src/pipeline.rs    GStreamer: appsrc → h265parse → decoder → queue → sin
 src/panel.rs       DRM probe, EDID, display_id
 examples/test_sender.rs, tests/integration.rs, systemd/, docs/
 ```
+
+## Extending the protocol
+
+[`PROTOCOL.md`](PROTOCOL.md) is normative and written so that other senders
+and receivers can be built against it (Windows or Linux senders, other
+panels). Read [§3 Versioning](PROTOCOL.md#3-versioning) before changing
+anything: §3.1 says exactly what a v1 peer does with input it does not know
+and what can be added without a version bump (for example a new message type
+gated by a new HELLO `caps` bit), and §3.3 says how to propose an extension.
+No v1 message accepts trailing bytes, so appending a field to an existing
+message needs a bump.
+
+This repository is the source of truth for `PROTOCOL.md`, `PLAN.md` and
+`protocol/fixtures/`. Change them here first, with code, fixtures and tests in
+the same PR; the sender repository then copies them with
+`scripts/sync-protocol.sh <path-to-this-repo>` and updates its codec and
+fixture list so every fixture still round-trips there.
+
+To add a fixture, add an entry to `fixture_messages()` in `src/protocol.rs`
+and run `cargo test gen_fixtures -- --ignored`. That test writes every fixture
+to `$TMPDIR/idp-fixtures-<pid>/` and checks each against the committed copy;
+it never writes into `protocol/fixtures/`, and for a new fixture it fails
+because there is no committed copy yet. Copy the new `.bin` from the temporary
+directory into `protocol/fixtures/` and run `cargo test` again.
+
+Planned extensions are in [`PLAN.md` §9](PLAN.md#9-public-release-and-next-steps).
+
+## Security
+
+See the warning at the top, [`SECURITY.md`](SECURITY.md) (including how to
+report a vulnerability privately) and
+[`PROTOCOL.md` §10](PROTOCOL.md#10-security).
+
+## License
+
+MIT; see [`LICENSE`](LICENSE).

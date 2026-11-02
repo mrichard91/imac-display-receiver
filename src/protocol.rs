@@ -947,11 +947,11 @@ mod tests {
 
     #[test]
     fn unknown_types_are_reported_with_their_length() {
-        let msg = Message::decode(0x09, &[1, 2, 3]).unwrap();
+        let msg = Message::decode(0xFF, &[1, 2, 3]).unwrap();
         assert_eq!(
             msg,
             Message::Unknown {
-                msg_type: 0x09,
+                msg_type: 0xFF,
                 len: 3
             }
         );

@@ -1,8 +1,10 @@
 # Network setup
 
-The receiver listens on every interface (port 7878 by default) and the sender
-connects to whatever address you type in **Connect…**, so any IP link works.
-Pick the fastest one you have:
+The receiver listens on every interface, IPv4 and IPv6 (port 7878 by
+default), and the sender connects to whatever address you type in
+**Connect…**, so any IP link works. Because v1 has no authentication or
+encryption, read [Firewall](#firewall) before connecting the iMac to anything
+but the cable to your Mac. Pick the fastest link you have:
 
 | link                         | typical throughput   | comfortable bitrate at 5K60 |
 |------------------------------|----------------------|-----------------------------|
@@ -18,9 +20,10 @@ measured rate; on Wi-Fi, re-run it after moving the Mac.
 
 ## Thunderbolt bridge (recommended)
 
-A direct Thunderbolt 3 cable between the Mac and the iMac gives a private
-point-to-point network with no router and no other hosts on it. Use a /30 so
-both ends are fixed:
+A direct Thunderbolt 3 cable between the Mac and the iMac gives a
+point-to-point network with no router and no other hosts on it (the receiver
+still listens on the iMac's other interfaces; see [Firewall](#firewall)).
+Use a /30 so both ends are fixed:
 
 | side  | interface         | address        |
 |-------|-------------------|----------------|
@@ -89,11 +92,69 @@ receiver logs the address it is listening on at startup:
 
 ## Firewall
 
-v1 has no authentication or encryption (PROTOCOL.md §10): anyone who can reach
-the port can put video on the panel. On a Thunderbolt or direct Ethernet link
-nobody else can reach it. On a shared LAN, restrict the port to your Macs:
+> [!WARNING]
+> Never expose the receiver to an untrusted network or the internet. Do not
+> port-forward 7878, and check that your router does not pass inbound IPv6 to
+> the iMac.
+
+v1 has no authentication or encryption
+([`PROTOCOL.md` §10](../PROTOCOL.md#10-security)). In practice that means:
+
+- the Mac's screen crosses the link in plaintext, so anyone who can capture
+  the traffic can watch it;
+- anyone who can reach the port can put arbitrary video on the panel, feed
+  attacker-chosen HEVC to the GStreamer parser and decoder, or hold the one
+  sender slot so your Mac gets `BUSY`;
+- every client that connects while no sender is connected receives HELLO:
+  the receiver's name (the hostname unless `RECEIVER_NAME` is set),
+  `display_id` and panel geometry.
+
+The firewall is the only access control. The receiver binds `[::]:7878`
+dual-stack and accepts on **every** interface, IPv4 and IPv6, including Wi-Fi
+and global IPv6 addresses, even if you only meant to use the Thunderbolt
+bridge; there is no option to bind one address or interface. A cable is
+private only if the iMac has no other network up, and Ubuntu ships with `ufw`
+disabled. So on any iMac that is also on a LAN or Wi-Fi, deny by default and
+allow only your Macs:
 
 ```sh
-sudo ufw allow from 10.99.0.0/30 to any port 7878 proto tcp
-sudo ufw allow from 192.168.1.20 to any port 7878 proto tcp    # a specific Mac
+sudo ufw default deny incoming
+sudo ufw allow OpenSSH                                          # if you use ssh
+sudo ufw allow from 10.99.0.0/30 to any port 7878 proto tcp     # Thunderbolt bridge
+sudo ufw allow from 192.168.1.20 to any port 7878 proto tcp     # a specific Mac
+sudo ufw enable
+sudo ufw status verbose
 ```
+
+A Mac that connects over IPv6 needs its own `ufw allow from <ipv6-address>`
+rule. Prefer one address per Mac to a whole subnet.
+
+The same restriction can be put on the service itself, which also works when
+`ufw` is off and covers IPv4 and IPv6 (`sudo systemctl edit imac-display-rx`):
+
+```ini
+[Service]
+IPAddressDeny=any
+IPAddressAllow=localhost 10.99.0.0/30 192.168.1.20
+```
+
+Check from a machine that should *not* get in: `nc -vz <imac-address> 7878`
+must fail. Watch for peers you do not recognise with
+`journalctl -u imac-display-rx | grep connected` (the receiver logs every
+peer address).
+
+Also:
+
+- Use the receiver only on networks you control; on shared or public Wi-Fi,
+  others can watch the stream even if the firewall keeps them off the port.
+- On the Mac, connect by IP address on a link you control rather than by
+  hostname, and turn off *Reconnect automatically* on networks you do not
+  control: the sender streams to whatever answers at that address.
+- Set `IDLE_SCREEN=false` if people you do not trust can see the panel; the
+  idle screen shows the receiver's name, addresses (all except loopback and
+  IPv6 link-local) and port.
+- Only enrol the Mac with `boltctl` if `boltctl list` shows it needs
+  authorization; `--policy auto` trusts that device on every future plug-in.
+
+See [`SECURITY.md`](../SECURITY.md) for the full list of known limitations and
+how to report a vulnerability.

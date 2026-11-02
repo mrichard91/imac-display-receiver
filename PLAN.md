@@ -40,7 +40,8 @@ this plan does not repeat it.
 
 ## 1. Repository layout
 
-The two programs live in **two repositories** (both private on GitHub):
+The two programs live in **two repositories** (both public on GitHub, MIT
+licensed; see each repo's `LICENSE` and `SECURITY.md`):
 `imac-display-receiver` and `imac-display-sender`. Each carries an identical
 copy of `PROTOCOL.md`, `PLAN.md` and `protocol/fixtures/`. The receiver repo is
 the source of truth for fixtures; the sender repo's
@@ -134,8 +135,10 @@ Owns: `receiver/src/protocol.rs`, `protocol/fixtures/`.
   `encode(&self, &mut Vec<u8>)` / `decode(type, payload) -> Result`.
 - `FRAME` decode must be zero-copy friendly: expose `FrameHeader` (12 bytes)
   separately so `net.rs` can read the AU directly into a `gst::Buffer`.
-- `#[test] #[ignore] gen_fixtures` writes every file in PROTOCOL §12 into
-  `protocol/fixtures/`. A normal test reads each fixture, decodes, re-encodes,
+- `#[test] #[ignore] gen_fixtures` encodes every message in PROTOCOL §12.
+  As built it writes them to `$TMPDIR/idp-fixtures-<pid>/` and asserts each
+  equals the committed copy in `protocol/fixtures/`; a new fixture is copied
+  in by hand (see D1). A normal test reads each fixture, decodes, re-encodes,
   asserts byte equality. Verify `hello_imac.bin` equals the hex in §6.1.2.
 - Unknown type → `Message::Unknown { type, len }` so callers can skip.
 Accept: `cargo test` green; fixtures committed; hex in §6.1.2 matches.
@@ -208,7 +211,7 @@ Owns: `receiver/systemd/`, `README.md` (receiver section), `docs/network-setup.m
   `10.99.0.1/30`, no router; Ubuntu `nmcli ... thunderbolt0 10.99.0.2/30`),
   Ethernet alternative, `boltctl` authorization, firewall note (PROTOCOL §10).
 Accept: fresh Ubuntu 24.04 iMac follows README to a running service; `ss -ltn`
-shows `0.0.0.0:7878`.
+shows `*:7878` (dual-stack `[::]`, IPv4 and IPv6).
 
 ---
 
@@ -446,7 +449,8 @@ with no iMac.
 
 ## 8. Out of scope for v1 (tracked for v2)
 
-- Encryption/authentication (PROTOCOL §10 reserves it).
+- Encryption/authentication (PROTOCOL §10 reserves it; design notes in P2,
+  §9).
 - Multiple simultaneous senders with switching (receiver currently BUSY).
   Design hook: STREAM_STOP already expresses "paused but connected".
 - Keyboard/mouse forwarding (software KVM).
@@ -455,3 +459,199 @@ with no iMac.
 - Lossless changed-rectangle mode for sharper text.
 - Continuous adaptive bitrate from STATS (v1 sets bitrate from the speed test).
 - Bonjour discovery (`_idp._tcp`) so the Connect… list fills itself.
+
+---
+
+## 9. Public release and next steps
+
+Both repositories went public under the MIT license on 2026-11-02. The tasks
+below continue the numbering above; never renumber them (code and commits
+cite `PLAN R6`, `PLAN S3` and so on). §0 still applies. Tasks marked P change
+the wire protocol: edit `PROTOCOL.md` and the fixtures in the receiver repo
+first, then sync the sender (§1). Each one also needs a §13 changelog entry
+and a decision, recorded in PROTOCOL §3, on whether it needs a version
+bump.
+
+Before writing an extension, read PROTOCOL §3.1 (what a v1 peer does with
+unknown input; what is safe without a version bump) and §3.3 (how to propose
+one). In particular, no v1 message accepts trailing bytes, so no field can be
+appended to an existing message without a bump. On the receiver a new
+*control* type must also be added to `net::is_control()` (which also gives
+it the 65,573-byte control cap), or `FramedReader` skips it as unknown.
+
+### R7 — Receiver failure modes when the sink cannot open the panel
+Owns: `receiver/src/{main.rs,session.rs,slot.rs,idle.rs,pipeline.rs}`.
+Found in field testing on 2026-11-02. When the sink cannot open the panel (a
+desktop session owns DRM master, or the service user cannot open
+`/dev/dri/*`), the receiver loops instead of failing clearly:
+- A slow-failing sink start (~5 s) runs while the session lock is held, so
+  HEARTBEATs stall; the sender declares the receiver dead after 2 s (PROTOCOL
+  §6.5), reconnects and gets `GOODBYE BUSY` while the old session is still
+  closing.
+- The idle screen's show/refresh retries run under the slot lock and once at
+  startup before the accept loop, which delays HELLO past the sender's 3 s
+  HELLO timeout (§7.3) on the first connection.
+- Nothing detects an unusable sink at startup.
+Fix:
+- Startup probe: before binding, open the configured sink briefly (or check
+  DRM master and `/dev/dri` access) and exit non-zero with one clear line
+  naming the cause and the fix (stop GDM / boot to `multi-user.target`, check
+  groups `video,render`). Make sure `Restart=always` then stops at the
+  systemd start limit rather than looping forever.
+- Build and start pipelines off the session lock, so HEARTBEAT, PONG and the
+  liveness check never wait on a GStreamer state change. A pipeline that
+  fails to start ends the session with `GOODBYE INTERNAL_ERROR`, not a
+  liveness timeout.
+- Idle screen: run it off the slot lock and after the listener is accepting,
+  stop retrying after a few failures, and never delay HELLO.
+Accept: integration test with a sink that takes 5 s to fail: HEARTBEATs keep
+arriving every 500 ms, the sender gets `GOODBYE INTERNAL_ERROR`, and a
+reconnect straight after is not `BUSY` for longer than `HANDOVER_WAIT` (1 s);
+HELLO arrives within 3 s of connecting with the idle screen failing; starting
+with `/dev/dri` inaccessible exits non-zero with the one-line cause.
+
+### R8 — Desktop / window mode
+Owns: `receiver/src/{main.rs,pipeline.rs,idle.rs}`, `README.md`.
+- `--mode kms|window` (env `MODE`, default `kms`). In `window` mode, while a
+  sender is connected, show the stream as a fullscreen window over an existing
+  X11 or Wayland session (`waylandsink fullscreen=true`, or `glimagesink` /
+  `xvimagesink` on X11) and close it on disconnect, so the iMac stays a usable
+  desktop. Idle screen off in this mode.
+- No DRM master needed; runs as the desktop user (a `systemctl --user` unit
+  in `systemd/`), not as the `imac-display` system user.
+- HELLO caps bit 0 reflects the sink actually used. Check whether the VA
+  DMABuf path survives into the window sink; if not, record the CPU cost.
+Accept: on Ubuntu 24.04 GNOME (Wayland and X11), connecting covers the panel,
+disconnecting returns to the desktop, and the existing `kms` path is unchanged.
+
+### R9 — `nvh265dec` in the decoder preference list
+Owns: `receiver/src/pipeline.rs`.
+- Add `nvh265dec` (GStreamer `nvcodec`) to `DECODER_PREFERENCE` after the VA
+  decoders and before `avdec_h265`, with whatever download/convert step its
+  output needs for the chosen sink. Not useful on the iMac (AMD), but it lets
+  NVIDIA Linux machines act as receivers, mainly in window mode (R8).
+Accept: on an NVIDIA box with `DECODER=auto` the log shows `nvh265dec`; unit
+test for the preference order; no change on VA machines.
+
+### R10 — systemd hardening
+Owns: `receiver/systemd/imac-display-rx.service`, `README.md` (service section).
+- Add `DevicePolicy=closed`, `DeviceAllow=char-drm rw` (group `video` also
+  grants `/dev/video*`, i.e. the iMac's camera), `CapabilityBoundingSet=`,
+  `ProtectKernelModules`, `ProtectKernelLogs`, `ProtectClock`,
+  `ProtectHostname`, `RestrictNamespaces`, `LockPersonality`,
+  `RestrictRealtime`, `RestrictSUIDSGID`, `SystemCallArchitectures=native`,
+  `SystemCallFilter=@system-service`, `MemoryMax=1G`, `TasksMax=256`.
+- Ship a commented `IPAddressDeny=any` / `IPAddressAllow=` example.
+- Revisit `Restart=always` / `RestartSec=1`: a decoder crash a peer can
+  trigger should not be retryable without limit.
+Accept: `systemd-analyze security imac-display-rx` score recorded before and
+after; `kmssink` + `vah265dec` and the `avdec_h265` fallback still work on the
+iMac.
+
+### R11 — Receiver input hardening (no wire change)
+Owns: `receiver/src/{main.rs,net.rs,session.rs,speedtest.rs,pipeline.rs}`.
+From the 2026-11-02 audit (see PROTOCOL §10.1 and the Known limitations in
+`SECURITY.md`):
+- `--listen` / `LISTEN_ADDR` to bind one address, and an optional
+  `ALLOW_FROM` CIDR list checked at accept.
+- Deadlines for PAUSED, WAIT_KEYFRAME and chained speed tests, so one
+  connection cannot hold the slot indefinitely.
+- Check the session state before reading a FRAME body (today a FRAME before
+  STREAM_START is read into a buffer of up to 64 MiB first).
+- Cap concurrent connection threads; rate-limit STREAM_START (each rebuilds
+  the pipeline) and PONG.
+- Check the SPS profile and size from `h265parse` caps against STREAM_START
+  before the decoder sees the stream.
+Any limit a conforming v1 sender could hit goes into PROTOCOL.md first.
+Accept: integration tests for each limit; the existing tests stay green.
+
+### S8 — Sender input hardening (no wire change)
+Owns: `sender/Sources/IDPCore/{Connection,FramedReader,VirtualDisplaySpec}.swift`,
+`SenderSession.swift`.
+- Bounds-check HELLO before it reaches `CGVirtualDisplay` (for example
+  320 ≤ width, height ≤ 16384; refresh 1–500 Hz) and fail with a clear error.
+- Treat the HELLO name and GOODBYE text as untrusted: cap the length (for
+  example 64 characters) and strip control and bidi characters before showing,
+  storing or naming the display with them.
+- Cap control-message length in `FramedReader` before buffering (the receiver
+  uses 38 + 65,535 bytes).
+- Rate-limit KEYFRAME_REQUEST handling (≥ 1 s apart) and PONG replies.
+- Remember `display_id` per host:port and warn when it changes. This catches
+  a wrong host, not an attacker (`display_id` is public).
+Accept: unit tests for each bound; fixtures still round-trip.
+
+### P1 — SENDER_CAPS: sender capability advertisement
+Owns: `PROTOCOL.md` (§3.1.4, §3.2, §5, §6, §13), both codecs, fixtures.
+Today a sender says nothing about itself until STREAM_START
+(`protocol_version`, `codec`, `sflags` bit 0), which can come after a
+connect-time speed test. A receiver cannot tell whether a sender uses STATS,
+honours `max_bitrate_kbps` or supports a feature it has simply not used yet.
+- Specify type 0x17 SENDER_CAPS, reserved by PROTOCOL §3.1.4 with no layout
+  yet (0x16 is never assigned: it is the first byte of a TLS handshake
+  record, §10.3): sender → receiver, sent once right after HELLO is accepted
+  (before any speed test), carrying the sender's `protocol_version`, a caps
+  bitmask, a codecs bitmask (same bit numbering as HELLO, §3.2.2) and
+  optionally a name.
+  Gate it on a new HELLO `caps` bit (§3.1.3). A receiver MUST NOT require it,
+  since v1 senders never send it.
+- Decide whether SENDER_CAPS is "minimum length, trailing bytes ignored" so
+  it can grow without a bump; no v1 message works that way (§3.1.2), so say
+  so explicitly in §3.
+- Receiver: add the type to `net::is_control()`. Sender: `MessageType` case,
+  `Message` encode/decode, `Connection.handle`. New fixture listed in
+  `fixture_messages()` and in the Swift `FixtureTests` list; the sender's
+  tests fail on the synced fixture until its codec is updated, so land both
+  PRs together.
+Accept: v1 sender ↔ new receiver and new sender ↔ v1 receiver both stream
+(the new sender sends no SENDER_CAPS to a receiver without the caps bit);
+fixture round-trips in both suites.
+
+### P2 — v2 security: encryption and authentication
+Owns: `PROTOCOL.md` §3.2 and §10 (new subsections; never renumber existing
+ones), both repos.
+Goals: nobody on the path can see the stream; the sender knows it is talking
+to the receiver it paired with; the receiver accepts only paired senders.
+- PROTOCOL §10.3 lists the constraints: v1's receiver speaks first, so TLS
+  cannot start before HELLO without breaking v1 peers (a receiver waiting for
+  a ClientHello would time out v1 senders after 3 s, and a v1 receiver parses
+  a TLS record as an IDP header and never answers with a ServerHello). Prefer
+  an upgrade after HELLO: a HELLO caps bit "secure upgrade available" plus a
+  new upgrade message, then TLS 1.3 on the same socket with HELLO re-sent
+  inside it.
+- Keys: TLS with pinned self-signed certificates (trust on first use, key
+  fingerprint shown on the receiver's idle screen) or a pre-shared key.
+- Pairing code: a short code shown on the panel and typed on the Mac. It must
+  go through a PAKE (SPAKE2, CPace) or only authenticate the pinned key; a
+  6-digit code used directly as a TLS PSK can be brute-forced offline.
+- Downgrade protection: once paired, the sender refuses plaintext to that
+  receiver; the receiver gets `REQUIRE_TLS` to refuse v1 senders.
+- Sender UI: show the receiver's identity (name plus key fingerprint),
+  confirm the first connection, warn loudly and stop when it changes; list
+  and forget paired receivers. Receiver: list and revoke paired senders.
+- Reserve the type codes and `caps` bit the design needs in PROTOCOL §3.2
+  early, so no other extension takes them (0x17 is already SENDER_CAPS;
+  0x16 stays unassigned so a receiver can tell a TLS ClientHello from IDP by
+  its first byte).
+Accept: §10 specifies v2 normatively (upgrade, pairing, downgrade rules) and
+§10.1 is updated for it; `tcpdump` on the link shows no plaintext
+HEVC; a spoofed receiver is refused; v1 ↔ v2 still interoperate in plaintext
+unless `REQUIRE_TLS` is set or the receiver is paired.
+
+### D1 — Docs and testing
+Owns: `README.md` (both), `PROTOCOL.md`, `protocol/`, CI config.
+- "Tested on" matrix in both READMEs, filled only from real runs: receiver
+  (iMac model, GPU, Ubuntu, kernel, Mesa, GStreamer, decoder, sink, link) and
+  sender (Mac model, chip, macOS). Mark everything else untested.
+- Keep PROTOCOL.md matched to the code: the 2026-11-02 audit fixes (§1
+  `[::]`, §9 error list, §12 `gen_fixtures`) are in; recheck the §3.1.2 and
+  §10.1 "reference implementation" statements whenever R11 or S8 lands.
+- Make adding a fixture one step: let `gen_fixtures` write a missing file
+  (for example when `IDP_WRITE_FIXTURES=1`) instead of panicking, and have
+  the Swift `FixtureTests` name the file that is missing from its list.
+- CI: `cargo test --release` with the software decoder on Linux, `swift test`
+  on macOS, and a job that runs `scripts/sync-protocol.sh` and fails if the
+  sender's copies have drifted.
+Accept: both READMEs carry the matrix; CI green on `main` in both repos.
+
+Suggested order: R7, R10 and D1 first (they affect anyone trying the
+repositories now), then R11 and S8, R8 and R9, P1, and P2 last.
